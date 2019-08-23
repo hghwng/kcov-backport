@@ -1,0 +1,2230 @@
+diff --git a/Documentation/dev-tools/kcov.rst b/Documentation/dev-tools/kcov.rst
+new file mode 100644
+index 000000000000..3534f0a1c7b3
+--- /dev/null
++++ b/Documentation/dev-tools/kcov.rst
+@@ -0,0 +1,199 @@
++kcov: code coverage for fuzzing
++===============================
++
++kcov exposes kernel code coverage information in a form suitable for coverage-
++guided fuzzing (randomized testing). Coverage data of a running kernel is
++exported via the "kcov" debugfs file. Coverage collection is enabled on a task
++basis, and thus it can capture precise coverage of a single system call.
++
++Note that kcov does not aim to collect as much coverage as possible. It aims
++to collect more or less stable coverage that is function of syscall inputs.
++To achieve this goal it does not collect coverage in soft/hard interrupts
++and instrumentation of some inherently non-deterministic parts of kernel is
++disbled (e.g. scheduler, locking).
++
++kcov is also able to collect comparison operands from the instrumented code
++(this feature currently requires that the kernel is compiled with clang).
++
++Prerequisites
++-------------
++
++Configure the kernel with::
++
++        CONFIG_KCOV=y
++
++CONFIG_KCOV requires gcc built on revision 231296 or later.
++
++If the comparison operands need to be collected, set::
++
++	CONFIG_KCOV_ENABLE_COMPARISONS=y
++
++Profiling data will only become accessible once debugfs has been mounted::
++
++        mount -t debugfs none /sys/kernel/debug
++
++The following program demonstrates kcov usage from within a test program::
++
++    #include <stdio.h>
++    #include <stddef.h>
++    #include <stdint.h>
++    #include <stdlib.h>
++    #include <sys/types.h>
++    #include <sys/stat.h>
++    #include <sys/ioctl.h>
++    #include <sys/mman.h>
++    #include <unistd.h>
++    #include <fcntl.h>
++
++    #define KCOV_INIT_TRACE			_IOR('c', 1, unsigned long)
++    #define KCOV_ENABLE			_IO('c', 100)
++    #define KCOV_DISABLE			_IO('c', 101)
++    #define COVER_SIZE			(64<<10)
++
++    #define KCOV_TRACE_PC  0
++    #define KCOV_TRACE_CMP 1
++
++    int main(int argc, char **argv)
++    {
++	int fd;
++	unsigned long *cover, n, i;
++
++	/* A single fd descriptor allows coverage collection on a single
++	 * thread.
++	 */
++	fd = open("/sys/kernel/debug/kcov", O_RDWR);
++	if (fd == -1)
++		perror("open"), exit(1);
++	/* Setup trace mode and trace size. */
++	if (ioctl(fd, KCOV_INIT_TRACE, COVER_SIZE))
++		perror("ioctl"), exit(1);
++	/* Mmap buffer shared between kernel- and user-space. */
++	cover = (unsigned long*)mmap(NULL, COVER_SIZE * sizeof(unsigned long),
++				     PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++	if ((void*)cover == MAP_FAILED)
++		perror("mmap"), exit(1);
++	/* Enable coverage collection on the current thread. */
++	if (ioctl(fd, KCOV_ENABLE, KCOV_TRACE_PC))
++		perror("ioctl"), exit(1);
++	/* Reset coverage from the tail of the ioctl() call. */
++	__atomic_store_n(&cover[0], 0, __ATOMIC_RELAXED);
++	/* That's the target syscal call. */
++	read(-1, NULL, 0);
++	/* Read number of PCs collected. */
++	n = __atomic_load_n(&cover[0], __ATOMIC_RELAXED);
++	for (i = 0; i < n; i++)
++		printf("0x%lx\n", cover[i + 1]);
++	/* Disable coverage collection for the current thread. After this call
++	 * coverage can be enabled for a different thread.
++	 */
++	if (ioctl(fd, KCOV_DISABLE, 0))
++		perror("ioctl"), exit(1);
++	/* Free resources. */
++	if (munmap(cover, COVER_SIZE * sizeof(unsigned long)))
++		perror("munmap"), exit(1);
++	if (close(fd))
++		perror("close"), exit(1);
++	return 0;
++    }
++
++After piping through addr2line output of the program looks as follows::
++
++    SyS_read
++    fs/read_write.c:562
++    __fdget_pos
++    fs/file.c:774
++    __fget_light
++    fs/file.c:746
++    __fget_light
++    fs/file.c:750
++    __fget_light
++    fs/file.c:760
++    __fdget_pos
++    fs/file.c:784
++    SyS_read
++    fs/read_write.c:562
++
++If a program needs to collect coverage from several threads (independently),
++it needs to open /sys/kernel/debug/kcov in each thread separately.
++
++The interface is fine-grained to allow efficient forking of test processes.
++That is, a parent process opens /sys/kernel/debug/kcov, enables trace mode,
++mmaps coverage buffer and then forks child processes in a loop. Child processes
++only need to enable coverage (disable happens automatically on thread end).
++
++Comparison operands collection
++------------------------------
++Comparison operands collection is similar to coverage collection:
++
++.. code-block:: c
++
++    /* Same includes and defines as above. */
++
++    /* Number of 64-bit words per record. */
++    #define KCOV_WORDS_PER_CMP 4
++
++    /*
++     * The format for the types of collected comparisons.
++     *
++     * Bit 0 shows whether one of the arguments is a compile-time constant.
++     * Bits 1 & 2 contain log2 of the argument size, up to 8 bytes.
++     */
++
++    #define KCOV_CMP_CONST          (1 << 0)
++    #define KCOV_CMP_SIZE(n)        ((n) << 1)
++    #define KCOV_CMP_MASK           KCOV_CMP_SIZE(3)
++
++    int main(int argc, char **argv)
++    {
++	int fd;
++	uint64_t *cover, type, arg1, arg2, is_const, size;
++	unsigned long n, i;
++
++	fd = open("/sys/kernel/debug/kcov", O_RDWR);
++	if (fd == -1)
++		perror("open"), exit(1);
++	if (ioctl(fd, KCOV_INIT_TRACE, COVER_SIZE))
++		perror("ioctl"), exit(1);
++	/*
++	* Note that the buffer pointer is of type uint64_t*, because all
++	* the comparison operands are promoted to uint64_t.
++	*/
++	cover = (uint64_t *)mmap(NULL, COVER_SIZE * sizeof(unsigned long),
++				     PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++	if ((void*)cover == MAP_FAILED)
++		perror("mmap"), exit(1);
++	/* Note KCOV_TRACE_CMP instead of KCOV_TRACE_PC. */
++	if (ioctl(fd, KCOV_ENABLE, KCOV_TRACE_CMP))
++		perror("ioctl"), exit(1);
++	__atomic_store_n(&cover[0], 0, __ATOMIC_RELAXED);
++	read(-1, NULL, 0);
++	/* Read number of comparisons collected. */
++	n = __atomic_load_n(&cover[0], __ATOMIC_RELAXED);
++	for (i = 0; i < n; i++) {
++		type = cover[i * KCOV_WORDS_PER_CMP + 1];
++		/* arg1 and arg2 - operands of the comparison. */
++		arg1 = cover[i * KCOV_WORDS_PER_CMP + 2];
++		arg2 = cover[i * KCOV_WORDS_PER_CMP + 3];
++		/* ip - caller address. */
++		ip = cover[i * KCOV_WORDS_PER_CMP + 4];
++		/* size of the operands. */
++		size = 1 << ((type & KCOV_CMP_MASK) >> 1);
++		/* is_const - true if either operand is a compile-time constant.*/
++		is_const = type & KCOV_CMP_CONST;
++		printf("ip: 0x%lx type: 0x%lx, arg1: 0x%lx, arg2: 0x%lx, "
++			"size: %lu, %s\n",
++			ip, type, arg1, arg2, size,
++		is_const ? "const" : "non-const");
++	}
++	if (ioctl(fd, KCOV_DISABLE, 0))
++		perror("ioctl"), exit(1);
++	/* Free resources. */
++	if (munmap(cover, COVER_SIZE * sizeof(unsigned long)))
++		perror("munmap"), exit(1);
++	if (close(fd))
++		perror("close"), exit(1);
++	return 0;
++    }
++
++Note that the kcov modes (coverage collection or comparison operands) are
++mutually exclusive.
+diff --git a/Documentation/dev-tools/tools.rst b/Documentation/dev-tools/tools.rst
+new file mode 100644
+index 000000000000..9dcd0236a1ff
+--- /dev/null
++++ b/Documentation/dev-tools/tools.rst
+@@ -0,0 +1,19 @@
++================================
++Development tools for the kernel
++================================
++
++This document is a collection of documents about development tools that can
++be used to work on the kernel.  For now, the documents have been pulled
++together without any significant effot to integrate them into a coherent
++whole; patches welcome!
++
++.. class:: toc-title
++
++	   Table of contents
++
++.. toctree::
++   :maxdepth: 2
++
++   coccinelle
++   sparse
++   kcov
+diff --git a/Makefile b/Makefile
+index 924f98a4bc0f..163af0295867 100644
+--- a/Makefile
++++ b/Makefile
+@@ -348,6 +348,7 @@ LDFLAGS_MODULE  =
+ CFLAGS_KERNEL	=
+ AFLAGS_KERNEL	=
+ CFLAGS_GCOV	= -fprofile-arcs -ftest-coverage
++CFLAGS_KCOV	= -fsanitize-coverage=trace-pc
+ 
+ 
+ # Use USERINCLUDE when you must reference the UAPI directories only.
+@@ -618,6 +619,7 @@ endif
+ 
+ KBUILD_CFLAGS   += $(call cc-option, -fno-var-tracking-assignments)
+ 
++KBUILD_CFLAGS	+= -fno-pic
+ ifdef CONFIG_DEBUG_INFO
+ KBUILD_CFLAGS	+= -g
+ KBUILD_AFLAGS	+= -gdwarf-2
+@@ -625,7 +627,8 @@ endif
+ 
+ ifdef CONFIG_DEBUG_INFO_REDUCED
+ KBUILD_CFLAGS 	+= $(call cc-option, -femit-struct-debug-baseonly) \
+-		   $(call cc-option,-fno-var-tracking)
++		   $(call cc-option,-fno-var-tracking)\
++
+ endif
+ 
+ ifdef CONFIG_FUNCTION_TRACER
+diff --git a/arch/arm64/kvm/hyp/Makefile b/arch/arm64/kvm/hyp/Makefile
+new file mode 100644
+index 000000000000..0c85febcc1eb
+--- /dev/null
++++ b/arch/arm64/kvm/hyp/Makefile
+@@ -0,0 +1,26 @@
++#
++# Makefile for Kernel-based Virtual Machine module, HYP part
++#
++
++KVM=../../../../virt/kvm
++
++obj-$(CONFIG_KVM_ARM_HOST) += $(KVM)/arm/hyp/vgic-v2-sr.o
++obj-$(CONFIG_KVM_ARM_HOST) += $(KVM)/arm/hyp/timer-sr.o
++
++obj-$(CONFIG_KVM_ARM_HOST) += vgic-v3-sr.o
++obj-$(CONFIG_KVM_ARM_HOST) += sysreg-sr.o
++obj-$(CONFIG_KVM_ARM_HOST) += debug-sr.o
++obj-$(CONFIG_KVM_ARM_HOST) += entry.o
++obj-$(CONFIG_KVM_ARM_HOST) += switch.o
++obj-$(CONFIG_KVM_ARM_HOST) += fpsimd.o
++obj-$(CONFIG_KVM_ARM_HOST) += tlb.o
++obj-$(CONFIG_KVM_ARM_HOST) += hyp-entry.o
++obj-$(CONFIG_KVM_ARM_HOST) += s2-setup.o
++
++# KVM code is run at a different exception code with a different map, so
++# compiler instrumentation that inserts callbacks or checks into the code may
++# cause crashes. Just disable it.
++GCOV_PROFILE	:= n
++KASAN_SANITIZE	:= n
++UBSAN_SANITIZE	:= n
++KCOV_INSTRUMENT	:= n
+diff --git a/arch/s390/include/asm/ipl.h b/arch/s390/include/asm/ipl.h
+index 2bd6cb897b90..9d6a963070ae 100644
+--- a/arch/s390/include/asm/ipl.h
++++ b/arch/s390/include/asm/ipl.h
+@@ -91,7 +91,7 @@ extern unsigned int zfcpdump_prefix_array[];
+ extern void do_reipl(void);
+ extern void do_halt(void);
+ extern void do_poff(void);
+-extern void ipl_save_parameters(void);
++extern void ipl_verify_parameters(void);
+ extern void ipl_update_parameters(void);
+ extern size_t append_ipl_vmparm(char *, size_t);
+ extern size_t append_ipl_scpdata(char *, size_t);
+diff --git a/arch/s390/kernel/Makefile b/arch/s390/kernel/Makefile
+index 4bb2a4656163..dbf047a31dbe 100644
+--- a/arch/s390/kernel/Makefile
++++ b/arch/s390/kernel/Makefile
+@@ -2,6 +2,9 @@
+ # Makefile for the linux kernel.
+ #
+ 
++KCOV_INSTRUMENT_early.o := n
++KCOV_INSTRUMENT_sclp.o := n
++
+ ifdef CONFIG_FUNCTION_TRACER
+ # Don't trace early setup code and tracing code
+ CFLAGS_REMOVE_early.o = -pg
+diff --git a/arch/s390/kernel/early.c b/arch/s390/kernel/early.c
+index dc8770d7173c..8ca5d2d1e62d 100644
+--- a/arch/s390/kernel/early.c
++++ b/arch/s390/kernel/early.c
+@@ -403,7 +403,7 @@ static __init void rescue_initrd(void)
+ 		return;
+ 	if (INITRD_START >= min_initrd_addr)
+ 		return;
+-	memmove((void *) min_initrd_addr, (void *) INITRD_START, INITRD_SIZE);
++	memmove_early((void *) min_initrd_addr, (void *) INITRD_START, INITRD_SIZE);
+ 	INITRD_START = min_initrd_addr;
+ #endif
+ }
+diff --git a/arch/s390/kernel/ipl.c b/arch/s390/kernel/ipl.c
+index feb719d3c851..85151cf2fb9d 100644
+--- a/arch/s390/kernel/ipl.c
++++ b/arch/s390/kernel/ipl.c
+@@ -1978,10 +1978,9 @@ void __init ipl_update_parameters(void)
+ 		diag308_set_works = 1;
+ }
+ 
+-void __init ipl_save_parameters(void)
++void __init ipl_verify_parameters(void)
+ {
+ 	struct cio_iplinfo iplinfo;
+-	void *src, *dst;
+ 
+ 	if (cio_get_iplinfo(&iplinfo))
+ 		return;
+@@ -1991,10 +1990,6 @@ void __init ipl_save_parameters(void)
+ 	if (!iplinfo.is_qdio)
+ 		return;
+ 	ipl_flags |= IPL_PARMBLOCK_VALID;
+-	src = (void *)(unsigned long)S390_lowcore.ipl_parmblock_ptr;
+-	dst = (void *)IPL_PARMBLOCK_ORIGIN;
+-	memmove(dst, src, PAGE_SIZE);
+-	S390_lowcore.ipl_parmblock_ptr = IPL_PARMBLOCK_ORIGIN;
+ }
+ 
+ static LIST_HEAD(rcall);
+diff --git a/arch/um/kernel/Makefile b/arch/um/kernel/Makefile
+index d8b78a03855c..f0e1970af61b 100644
+--- a/arch/um/kernel/Makefile
++++ b/arch/um/kernel/Makefile
+@@ -3,6 +3,11 @@
+ # Licensed under the GPL
+ #
+ 
++# Don't instrument UML-specific code; without this, we may crash when
++# accessing the instrumentation buffer for the first time from the
++# kernel.
++KCOV_INSTRUMENT                := n
++
+ CPPFLAGS_vmlinux.lds := -DSTART=$(LDS_START)		\
+                         -DELF_ARCH=$(LDS_ELF_ARCH)	\
+                         -DELF_FORMAT=$(LDS_ELF_FORMAT)	\
+diff --git a/arch/um/os-Linux/Makefile b/arch/um/os-Linux/Makefile
+index 08ff5094fcdd..ada473bf6f46 100644
+--- a/arch/um/os-Linux/Makefile
++++ b/arch/um/os-Linux/Makefile
+@@ -3,6 +3,9 @@
+ # Licensed under the GPL
+ #
+ 
++# Don't instrument UML-specific code
++KCOV_INSTRUMENT                := n
++
+ obj-y = aio.o execvp.o file.o helper.o irq.o main.o mem.o process.o \
+ 	registers.o sigio.o signal.o start_up.o time.o tty.o \
+ 	umid.o user_syms.o util.o drivers/ skas/
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 105ae30a176b..b75f8e2447b0 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -24,6 +24,7 @@ config X86
+ 	select HAVE_AOUT if X86_32
+ 	select HAVE_UNSTABLE_SCHED_CLOCK
+ 	select ARCH_SUPPORTS_NUMA_BALANCING
++	select ARCH_HAS_KCOV if X86_64
+ 	select ARCH_WANTS_PROT_NUMA_PROT_NONE
+ 	select HAVE_IDE
+ 	select HAVE_OPROFILE
+diff --git a/arch/x86/boot/Makefile b/arch/x86/boot/Makefile
+index 368f3582c93e..e4b434b2f014 100644
+--- a/arch/x86/boot/Makefile
++++ b/arch/x86/boot/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # arch/x86/boot/Makefile
+ #
+@@ -14,6 +15,7 @@
+ # Set it to -DSVGA_MODE=NORMAL_VGA if you just want the EGA/VGA mode.
+ # The number is the same as you would ordinarily press at bootup.
+ 
++KCOV_INSTRUMENT		:= n
+ SVGA_MODE	:= -DSVGA_MODE=NORMAL_VGA
+ 
+ targets		:= vmlinux.bin setup.bin setup.elf bzImage
+diff --git a/arch/x86/boot/compressed/Makefile b/arch/x86/boot/compressed/Makefile
+index 349cf190d236..4358766659de 100644
+--- a/arch/x86/boot/compressed/Makefile
++++ b/arch/x86/boot/compressed/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # linux/arch/x86/boot/compressed/Makefile
+ #
+@@ -6,6 +7,7 @@
+ 
+ targets := vmlinux vmlinux.bin vmlinux.bin.gz vmlinux.bin.bz2 vmlinux.bin.lzma vmlinux.bin.xz vmlinux.bin.lzo
+ 
++KCOV_INSTRUMENT		:= n
+ KBUILD_CFLAGS := -m$(BITS) -D__KERNEL__ $(LINUX_INCLUDE) -O2
+ KBUILD_CFLAGS += -fno-strict-aliasing $(call cc-option, -fPIE, -fPIC)
+ KBUILD_CFLAGS += -DDISABLE_BRANCH_PROFILING
+diff --git a/arch/x86/crypto/Makefile b/arch/x86/crypto/Makefile
+index a3a0ed80f17c..81899f1c5f05 100644
+--- a/arch/x86/crypto/Makefile
++++ b/arch/x86/crypto/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # Arch-specific CryptoAPI modules.
+ #
+diff --git a/arch/x86/entry/vdso/Makefile b/arch/x86/entry/vdso/Makefile
+new file mode 100644
+index 000000000000..70ed969f07b5
+--- /dev/null
++++ b/arch/x86/entry/vdso/Makefile
+@@ -0,0 +1,203 @@
++KCOV_INSTRUMENT := n
++#
++# Building vDSO images for x86.
++#
++
++KBUILD_CFLAGS += $(DISABLE_LTO)
++KASAN_SANITIZE			:= n
++UBSAN_SANITIZE			:= n
++OBJECT_FILES_NON_STANDARD	:= y
++
++# Prevents link failures: __sanitizer_cov_trace_pc() is not linked in.
++KCOV_INSTRUMENT		:= n
++
++VDSO64-$(CONFIG_X86_64)		:= y
++VDSOX32-$(CONFIG_X86_X32_ABI)	:= y
++VDSO32-$(CONFIG_X86_32)		:= y
++VDSO32-$(CONFIG_IA32_EMULATION)	:= y
++
++# files to link into the vdso
++vobjs-y := vdso-note.o vclock_gettime.o vgetcpu.o
++
++# files to link into kernel
++obj-y				+= vma.o
++OBJECT_FILES_NON_STANDARD_vma.o	:= n
++
++# vDSO images to build
++vdso_img-$(VDSO64-y)		+= 64
++vdso_img-$(VDSOX32-y)		+= x32
++vdso_img-$(VDSO32-y)		+= 32
++
++obj-$(VDSO32-y)			+= vdso32-setup.o
++
++vobjs := $(foreach F,$(vobjs-y),$(obj)/$F)
++
++$(obj)/vdso.o: $(obj)/vdso.so
++
++targets += vdso.lds $(vobjs-y)
++
++# Build the vDSO image C files and link them in.
++vdso_img_objs := $(vdso_img-y:%=vdso-image-%.o)
++vdso_img_cfiles := $(vdso_img-y:%=vdso-image-%.c)
++vdso_img_sodbg := $(vdso_img-y:%=vdso%.so.dbg)
++obj-y += $(vdso_img_objs)
++targets += $(vdso_img_cfiles)
++targets += $(vdso_img_sodbg)
++.SECONDARY: $(vdso_img-y:%=$(obj)/vdso-image-%.c) \
++	$(vdso_img-y:%=$(obj)/vdso%.so)
++
++export CPPFLAGS_vdso.lds += -P -C
++
++VDSO_LDFLAGS_vdso.lds = -m64 -Wl,-soname=linux-vdso.so.1 \
++			-Wl,--no-undefined \
++			-Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096 \
++			$(DISABLE_LTO)
++
++$(obj)/vdso64.so.dbg: $(src)/vdso.lds $(vobjs) FORCE
++	$(call if_changed,vdso)
++
++HOST_EXTRACFLAGS += -I$(srctree)/tools/include -I$(srctree)/include/uapi -I$(srctree)/arch/x86/include/uapi
++hostprogs-y			+= vdso2c
++
++quiet_cmd_vdso2c = VDSO2C  $@
++define cmd_vdso2c
++	$(obj)/vdso2c $< $(<:%.dbg=%) $@
++endef
++
++$(obj)/vdso-image-%.c: $(obj)/vdso%.so.dbg $(obj)/vdso%.so $(obj)/vdso2c FORCE
++	$(call if_changed,vdso2c)
++
++#
++# Don't omit frame pointers for ease of userspace debugging, but do
++# optimize sibling calls.
++#
++CFL := $(PROFILING) -mcmodel=small -fPIC -O2 -fasynchronous-unwind-tables -m64 \
++       $(filter -g%,$(KBUILD_CFLAGS)) $(call cc-option, -fno-stack-protector) \
++       -fno-omit-frame-pointer -foptimize-sibling-calls \
++       -DDISABLE_BRANCH_PROFILING -DBUILD_VDSO
++
++$(vobjs): KBUILD_CFLAGS += $(CFL)
++
++#
++# vDSO code runs in userspace and -pg doesn't help with profiling anyway.
++#
++CFLAGS_REMOVE_vdso-note.o = -pg
++CFLAGS_REMOVE_vclock_gettime.o = -pg
++CFLAGS_REMOVE_vgetcpu.o = -pg
++CFLAGS_REMOVE_vvar.o = -pg
++
++#
++# X32 processes use x32 vDSO to access 64bit kernel data.
++#
++# Build x32 vDSO image:
++# 1. Compile x32 vDSO as 64bit.
++# 2. Convert object files to x32.
++# 3. Build x32 VDSO image with x32 objects, which contains 64bit codes
++# so that it can reach 64bit address space with 64bit pointers.
++#
++
++CPPFLAGS_vdsox32.lds = $(CPPFLAGS_vdso.lds)
++VDSO_LDFLAGS_vdsox32.lds = -Wl,-m,elf32_x86_64 \
++			   -Wl,-soname=linux-vdso.so.1 \
++			   -Wl,-z,max-page-size=4096 \
++			   -Wl,-z,common-page-size=4096
++
++# 64-bit objects to re-brand as x32
++vobjs64-for-x32 := $(filter-out $(vobjs-nox32),$(vobjs-y))
++
++# x32-rebranded versions
++vobjx32s-y := $(vobjs64-for-x32:.o=-x32.o)
++
++# same thing, but in the output directory
++vobjx32s := $(foreach F,$(vobjx32s-y),$(obj)/$F)
++
++# Convert 64bit object file to x32 for x32 vDSO.
++quiet_cmd_x32 = X32     $@
++      cmd_x32 = $(OBJCOPY) -O elf32-x86-64 $< $@
++
++$(obj)/%-x32.o: $(obj)/%.o FORCE
++	$(call if_changed,x32)
++
++targets += vdsox32.lds $(vobjx32s-y)
++
++$(obj)/%.so: OBJCOPYFLAGS := -S
++$(obj)/%.so: $(obj)/%.so.dbg
++	$(call if_changed,objcopy)
++
++$(obj)/vdsox32.so.dbg: $(src)/vdsox32.lds $(vobjx32s) FORCE
++	$(call if_changed,vdso)
++
++CPPFLAGS_vdso32.lds = $(CPPFLAGS_vdso.lds)
++VDSO_LDFLAGS_vdso32.lds = -m32 -Wl,-m,elf_i386 -Wl,-soname=linux-gate.so.1
++
++# This makes sure the $(obj) subdirectory exists even though vdso32/
++# is not a kbuild sub-make subdirectory.
++override obj-dirs = $(dir $(obj)) $(obj)/vdso32/
++
++targets += vdso32/vdso32.lds
++targets += vdso32/note.o vdso32/vclock_gettime.o vdso32/system_call.o
++targets += vdso32/vclock_gettime.o
++
++KBUILD_AFLAGS_32 := $(filter-out -m64,$(KBUILD_AFLAGS)) -DBUILD_VDSO
++$(obj)/vdso32.so.dbg: KBUILD_AFLAGS = $(KBUILD_AFLAGS_32)
++$(obj)/vdso32.so.dbg: asflags-$(CONFIG_X86_64) += -m32
++
++KBUILD_CFLAGS_32 := $(filter-out -m64,$(KBUILD_CFLAGS))
++KBUILD_CFLAGS_32 := $(filter-out -mcmodel=kernel,$(KBUILD_CFLAGS_32))
++KBUILD_CFLAGS_32 := $(filter-out -fno-pic,$(KBUILD_CFLAGS_32))
++KBUILD_CFLAGS_32 := $(filter-out -mfentry,$(KBUILD_CFLAGS_32))
++KBUILD_CFLAGS_32 += -m32 -msoft-float -mregparm=0 -fpic
++KBUILD_CFLAGS_32 += $(call cc-option, -fno-stack-protector)
++KBUILD_CFLAGS_32 += $(call cc-option, -foptimize-sibling-calls)
++KBUILD_CFLAGS_32 += -fno-omit-frame-pointer
++KBUILD_CFLAGS_32 += -DDISABLE_BRANCH_PROFILING
++$(obj)/vdso32.so.dbg: KBUILD_CFLAGS = $(KBUILD_CFLAGS_32)
++
++$(obj)/vdso32.so.dbg: FORCE \
++		      $(obj)/vdso32/vdso32.lds \
++		      $(obj)/vdso32/vclock_gettime.o \
++		      $(obj)/vdso32/note.o \
++		      $(obj)/vdso32/system_call.o
++	$(call if_changed,vdso)
++
++#
++# The DSO images are built using a special linker script.
++#
++quiet_cmd_vdso = VDSO    $@
++      cmd_vdso = $(CC) -nostdlib -o $@ \
++		       $(VDSO_LDFLAGS) $(VDSO_LDFLAGS_$(filter %.lds,$(^F))) \
++		       -Wl,-T,$(filter %.lds,$^) $(filter %.o,$^) && \
++		 sh $(srctree)/$(src)/checkundef.sh '$(NM)' '$@'
++
++VDSO_LDFLAGS = -fPIC -shared $(call cc-ldoption, -Wl$(comma)--hash-style=both) \
++	$(call cc-ldoption, -Wl$(comma)--build-id) -Wl,-Bsymbolic $(LTO_CFLAGS)
++GCOV_PROFILE := n
++
++#
++# Install the unstripped copies of vdso*.so.  If our toolchain supports
++# build-id, install .build-id links as well.
++#
++quiet_cmd_vdso_install = INSTALL $(@:install_%=%)
++define cmd_vdso_install
++	cp $< "$(MODLIB)/vdso/$(@:install_%=%)"; \
++	if readelf -n $< |grep -q 'Build ID'; then \
++	  buildid=`readelf -n $< |grep 'Build ID' |sed -e 's/^.*Build ID: \(.*\)$$/\1/'`; \
++	  first=`echo $$buildid | cut -b-2`; \
++	  last=`echo $$buildid | cut -b3-`; \
++	  mkdir -p "$(MODLIB)/vdso/.build-id/$$first"; \
++	  ln -sf "../../$(@:install_%=%)" "$(MODLIB)/vdso/.build-id/$$first/$$last.debug"; \
++	fi
++endef
++
++vdso_img_insttargets := $(vdso_img_sodbg:%.dbg=install_%)
++
++$(MODLIB)/vdso: FORCE
++	@mkdir -p $(MODLIB)/vdso
++
++$(vdso_img_insttargets): install_%: $(obj)/%.dbg $(MODLIB)/vdso FORCE
++	$(call cmd,vdso_install)
++
++PHONY += vdso_install $(vdso_img_insttargets)
++vdso_install: $(vdso_img_insttargets) FORCE
++
++clean-files := vdso32.so vdso32.so.dbg vdso64* vdso-image-*.c vdsox32.so*
+diff --git a/arch/x86/ia32/Makefile b/arch/x86/ia32/Makefile
+index e785b422b766..a920fe50ed44 100644
+--- a/arch/x86/ia32/Makefile
++++ b/arch/x86/ia32/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # Makefile for the ia32 kernel emulation subsystem.
+ #
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+index 111eb356dbea..d26ed8564aa1 100644
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # Makefile for the linux kernel.
+ #
+diff --git a/arch/x86/kernel/acpi/Makefile b/arch/x86/kernel/acpi/Makefile
+index 163b22581472..e36766bf27c3 100644
+--- a/arch/x86/kernel/acpi/Makefile
++++ b/arch/x86/kernel/acpi/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_ACPI)		+= boot.o
+ obj-$(CONFIG_ACPI_SLEEP)	+= sleep.o wakeup_$(BITS).o
+ 
+diff --git a/arch/x86/kernel/apic/Makefile b/arch/x86/kernel/apic/Makefile
+index 0ae0323b1f9c..5ff141ef4f6c 100644
+--- a/arch/x86/kernel/apic/Makefile
++++ b/arch/x86/kernel/apic/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # Makefile for local APIC drivers and for the IO-APIC code
+ #
+diff --git a/arch/x86/kernel/cpu/Makefile b/arch/x86/kernel/cpu/Makefile
+index b0684e4a73aa..a32706c46a94 100644
+--- a/arch/x86/kernel/cpu/Makefile
++++ b/arch/x86/kernel/cpu/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # Makefile for x86-compatible CPU details, features and quirks
+ #
+@@ -8,6 +9,10 @@ CFLAGS_REMOVE_common.o = -pg
+ CFLAGS_REMOVE_perf_event.o = -pg
+ endif
+ 
++# If these files are instrumented, boot hangs during the first second.
++KCOV_INSTRUMENT_common.o := n
++KCOV_INSTRUMENT_perf_event.o := n
++
+ # Make sure load_percpu_segment has no stackprotector
+ nostackp := $(call cc-option, -fno-stack-protector)
+ CFLAGS_common.o		:= $(nostackp)
+diff --git a/arch/x86/kernel/cpu/mcheck/Makefile b/arch/x86/kernel/cpu/mcheck/Makefile
+index bb34b03af252..61c376446182 100644
+--- a/arch/x86/kernel/cpu/mcheck/Makefile
++++ b/arch/x86/kernel/cpu/mcheck/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ obj-y				=  mce.o mce-severity.o
+ 
+ obj-$(CONFIG_X86_ANCIENT_MCE)	+= winchip.o p5.o
+diff --git a/arch/x86/kernel/cpu/mtrr/Makefile b/arch/x86/kernel/cpu/mtrr/Makefile
+index ad9e5ed81181..f12cef5c5aa8 100644
+--- a/arch/x86/kernel/cpu/mtrr/Makefile
++++ b/arch/x86/kernel/cpu/mtrr/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ obj-y		:= main.o if.o generic.o cleanup.o
+ obj-$(CONFIG_X86_32) += amd.o cyrix.o centaur.o
+ 
+diff --git a/arch/x86/kernel/kprobes/Makefile b/arch/x86/kernel/kprobes/Makefile
+index 0d33169cc1a2..4f68f7bbedd2 100644
+--- a/arch/x86/kernel/kprobes/Makefile
++++ b/arch/x86/kernel/kprobes/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # Makefile for kernel probes
+ #
+diff --git a/arch/x86/kvm/Makefile b/arch/x86/kvm/Makefile
+index d609e1d84048..d9c15c3bea61 100644
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ 
+ ccflags-y += -Ivirt/kvm -Iarch/x86/kvm
+ 
+diff --git a/arch/x86/lguest/Makefile b/arch/x86/lguest/Makefile
+index 94e0e54056a9..0a01508cc965 100644
+--- a/arch/x86/lguest/Makefile
++++ b/arch/x86/lguest/Makefile
+@@ -1,2 +1,3 @@
++KCOV_INSTRUMENT := n
+ obj-y		:= i386_head.o boot.o
+ CFLAGS_boot.o	:= $(call cc-option, -fno-stack-protector)
+diff --git a/arch/x86/lib/Makefile b/arch/x86/lib/Makefile
+index 96b2c6697c9d..c3f83d2f2300 100644
+--- a/arch/x86/lib/Makefile
++++ b/arch/x86/lib/Makefile
+@@ -1,7 +1,11 @@
++KCOV_INSTRUMENT := n
+ #
+ # Makefile for x86 specific library files.
+ #
+ 
++# Produces uninteresting flaky coverage.
++KCOV_INSTRUMENT_delay.o	:= n
++
+ inat_tables_script = $(srctree)/arch/x86/tools/gen-insn-attr-x86.awk
+ inat_tables_maps = $(srctree)/arch/x86/lib/x86-opcode-map.txt
+ quiet_cmd_inat_tables = GEN     $@
+diff --git a/arch/x86/math-emu/Makefile b/arch/x86/math-emu/Makefile
+index 9b0c63b60302..e3ff03a530e4 100644
+--- a/arch/x86/math-emu/Makefile
++++ b/arch/x86/math-emu/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ #               Makefile for wm-FPU-emu
+ #
+diff --git a/arch/x86/mm/Makefile b/arch/x86/mm/Makefile
+index 23d8e5fecf76..8c9c1de26267 100644
+--- a/arch/x86/mm/Makefile
++++ b/arch/x86/mm/Makefile
+@@ -1,3 +1,7 @@
++KCOV_INSTRUMENT := n
++# Kernel does not boot with instrumentation of tlb.c.
++KCOV_INSTRUMENT	:= n
++
+ obj-y	:=  init.o init_$(BITS).o fault.o ioremap.o extable.o pageattr.o mmap.o \
+ 	    pat.o pgtable.o physaddr.o gup.o setup_nx.o
+ 
+diff --git a/arch/x86/mm/kmemcheck/Makefile b/arch/x86/mm/kmemcheck/Makefile
+index 520b3bce4095..8d3874794fee 100644
+--- a/arch/x86/mm/kmemcheck/Makefile
++++ b/arch/x86/mm/kmemcheck/Makefile
+@@ -1 +1,2 @@
++KCOV_INSTRUMENT := n
+ obj-y := error.o kmemcheck.o opcode.o pte.o selftest.o shadow.o
+diff --git a/arch/x86/net/Makefile b/arch/x86/net/Makefile
+index 90568c33ddb0..dd7cfa728a8e 100644
+--- a/arch/x86/net/Makefile
++++ b/arch/x86/net/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # Arch-specific network modules
+ #
+diff --git a/arch/x86/oprofile/Makefile b/arch/x86/oprofile/Makefile
+index 1599f568f0e2..64b287526707 100644
+--- a/arch/x86/oprofile/Makefile
++++ b/arch/x86/oprofile/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_OPROFILE) += oprofile.o
+ 
+ DRIVER_OBJS = $(addprefix ../../../drivers/oprofile/, \
+diff --git a/arch/x86/pci/Makefile b/arch/x86/pci/Makefile
+index ee0af58ca5bd..d5297211e710 100644
+--- a/arch/x86/pci/Makefile
++++ b/arch/x86/pci/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ obj-y				:= i386.o init.o
+ 
+ obj-$(CONFIG_PCI_BIOS)		+= pcbios.o
+diff --git a/arch/x86/platform/Makefile b/arch/x86/platform/Makefile
+index 01e0231a113e..b171dac046ba 100644
+--- a/arch/x86/platform/Makefile
++++ b/arch/x86/platform/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ # Platform specific code goes here
+ obj-y	+= ce4100/
+ obj-y	+= efi/
+diff --git a/arch/x86/platform/ce4100/Makefile b/arch/x86/platform/ce4100/Makefile
+index 91fc92971d94..7e3e3fc74066 100644
+--- a/arch/x86/platform/ce4100/Makefile
++++ b/arch/x86/platform/ce4100/Makefile
+@@ -1 +1,2 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_X86_INTEL_CE)	+= ce4100.o
+diff --git a/arch/x86/platform/efi/Makefile b/arch/x86/platform/efi/Makefile
+index 6db1cc4c7534..341228245741 100644
+--- a/arch/x86/platform/efi/Makefile
++++ b/arch/x86/platform/efi/Makefile
+@@ -1,2 +1,3 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_EFI) 		+= efi.o efi_$(BITS).o efi_stub_$(BITS).o
+ obj-$(CONFIG_ACPI_BGRT) += efi-bgrt.o
+diff --git a/arch/x86/platform/geode/Makefile b/arch/x86/platform/geode/Makefile
+index 5b51194f4c8d..dd6571cd2cb4 100644
+--- a/arch/x86/platform/geode/Makefile
++++ b/arch/x86/platform/geode/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_ALIX)		+= alix.o
+ obj-$(CONFIG_NET5501)		+= net5501.o
+ obj-$(CONFIG_GEOS)		+= geos.o
+diff --git a/arch/x86/platform/goldfish/Makefile b/arch/x86/platform/goldfish/Makefile
+index f030b532fdf3..d58df9ca8465 100644
+--- a/arch/x86/platform/goldfish/Makefile
++++ b/arch/x86/platform/goldfish/Makefile
+@@ -1 +1,2 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_GOLDFISH)	+= goldfish.o
+diff --git a/arch/x86/platform/iris/Makefile b/arch/x86/platform/iris/Makefile
+index db921983a102..247d67700763 100644
+--- a/arch/x86/platform/iris/Makefile
++++ b/arch/x86/platform/iris/Makefile
+@@ -1 +1,2 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_X86_32_IRIS)		+= iris.o
+diff --git a/arch/x86/platform/mrst/Makefile b/arch/x86/platform/mrst/Makefile
+index af1da7e623f9..7347fe5987ff 100644
+--- a/arch/x86/platform/mrst/Makefile
++++ b/arch/x86/platform/mrst/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_X86_INTEL_MID)	+= mrst.o
+ obj-$(CONFIG_X86_INTEL_MID)	+= vrtc.o
+ obj-$(CONFIG_EARLY_PRINTK_INTEL_MID)	+= early_printk_mrst.o
+diff --git a/arch/x86/platform/olpc/Makefile b/arch/x86/platform/olpc/Makefile
+index fd332c533947..d847d144f159 100644
+--- a/arch/x86/platform/olpc/Makefile
++++ b/arch/x86/platform/olpc/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_OLPC)		+= olpc.o olpc_ofw.o olpc_dt.o
+ obj-$(CONFIG_OLPC_XO1_PM)		+= olpc-xo1-pm.o xo1-wakeup.o
+ obj-$(CONFIG_OLPC_XO1_RTC)	+= olpc-xo1-rtc.o
+diff --git a/arch/x86/platform/scx200/Makefile b/arch/x86/platform/scx200/Makefile
+index 762b4c7f4314..fcee878140e4 100644
+--- a/arch/x86/platform/scx200/Makefile
++++ b/arch/x86/platform/scx200/Makefile
+@@ -1,2 +1,3 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_SCx200)		+= scx200.o
+ scx200-y			+= scx200_32.o
+diff --git a/arch/x86/platform/sfi/Makefile b/arch/x86/platform/sfi/Makefile
+index cc5db1168a5e..bf45d6820b2d 100644
+--- a/arch/x86/platform/sfi/Makefile
++++ b/arch/x86/platform/sfi/Makefile
+@@ -1 +1,2 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_SFI)		+= sfi.o
+diff --git a/arch/x86/platform/ts5500/Makefile b/arch/x86/platform/ts5500/Makefile
+index c54e348c96a7..697169e6b292 100644
+--- a/arch/x86/platform/ts5500/Makefile
++++ b/arch/x86/platform/ts5500/Makefile
+@@ -1 +1,2 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_TS5500)	+= ts5500.o
+diff --git a/arch/x86/platform/uv/Makefile b/arch/x86/platform/uv/Makefile
+index 6c40995fefb8..23d95605edb2 100644
+--- a/arch/x86/platform/uv/Makefile
++++ b/arch/x86/platform/uv/Makefile
+@@ -1 +1,2 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_X86_UV)		+= tlb_uv.o bios_uv.o uv_irq.o uv_sysfs.o uv_time.o
+diff --git a/arch/x86/platform/visws/Makefile b/arch/x86/platform/visws/Makefile
+index 91bc17ab2fd5..4d9fe794714c 100644
+--- a/arch/x86/platform/visws/Makefile
++++ b/arch/x86/platform/visws/Makefile
+@@ -1 +1,2 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_X86_VISWS)	+= visws_quirks.o
+diff --git a/arch/x86/power/Makefile b/arch/x86/power/Makefile
+index a6a198c33623..a7bef96f6e25 100644
+--- a/arch/x86/power/Makefile
++++ b/arch/x86/power/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ # __restore_processor_state() restores %gs after S3 resume and so should not
+ # itself be stack-protected
+ nostackp := $(call cc-option, -fno-stack-protector)
+diff --git a/arch/x86/realmode/Makefile b/arch/x86/realmode/Makefile
+index 94f7fbe97b08..985fb51b7894 100644
+--- a/arch/x86/realmode/Makefile
++++ b/arch/x86/realmode/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # arch/x86/realmode/Makefile
+ #
+diff --git a/arch/x86/realmode/rm/Makefile b/arch/x86/realmode/rm/Makefile
+index 9cac82588cbc..465d2b645e26 100644
+--- a/arch/x86/realmode/rm/Makefile
++++ b/arch/x86/realmode/rm/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # arch/x86/realmode/Makefile
+ #
+@@ -7,6 +8,9 @@
+ #
+ #
+ 
++# Prevents link failures: __sanitizer_cov_trace_pc() is not linked in.
++KCOV_INSTRUMENT		:= n
++
+ always := realmode.bin realmode.relocs
+ 
+ wakeup-objs	:= wakeup_asm.o wakemain.o video-mode.o
+diff --git a/arch/x86/um/Makefile b/arch/x86/um/Makefile
+index eafa324eb7a5..9ded94f3d8de 100644
+--- a/arch/x86/um/Makefile
++++ b/arch/x86/um/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # Copyright (C) 2002 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+ #
+diff --git a/arch/x86/um/os-Linux/Makefile b/arch/x86/um/os-Linux/Makefile
+index 253bfb8cb702..296f7c4a75c3 100644
+--- a/arch/x86/um/os-Linux/Makefile
++++ b/arch/x86/um/os-Linux/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ #
+ # Copyright (C) 2000 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+ # Licensed under the GPL
+diff --git a/arch/x86/um/vdso/Makefile b/arch/x86/um/vdso/Makefile
+index 6c803ca49b5d..5ee5b5720259 100644
+--- a/arch/x86/um/vdso/Makefile
++++ b/arch/x86/um/vdso/Makefile
+@@ -1,7 +1,11 @@
++KCOV_INSTRUMENT := n
+ #
+ # Building vDSO images for x86.
+ #
+ 
++# Prevents link failures: __sanitizer_cov_trace_pc() is not linked in.
++KCOV_INSTRUMENT                := n
++
+ VDSO64-y		:= y
+ 
+ vdso-install-$(VDSO64-y)	+= vdso.so
+diff --git a/arch/x86/vdso/Makefile b/arch/x86/vdso/Makefile
+index fd14be1d1472..27c1af1bb170 100644
+--- a/arch/x86/vdso/Makefile
++++ b/arch/x86/vdso/Makefile
+@@ -1,7 +1,9 @@
++KCOV_INSTRUMENT := n
+ #
+ # Building vDSO images for x86.
+ #
+ 
++KCOV_INSTRUMENT		:= n
+ VDSO64-$(CONFIG_X86_64)		:= y
+ VDSOX32-$(CONFIG_X86_X32_ABI)	:= y
+ VDSO32-$(CONFIG_X86_32)		:= y
+diff --git a/arch/x86/video/Makefile b/arch/x86/video/Makefile
+index 2c447c94adcc..391b16fa2998 100644
+--- a/arch/x86/video/Makefile
++++ b/arch/x86/video/Makefile
+@@ -1 +1,2 @@
++KCOV_INSTRUMENT := n
+ obj-$(CONFIG_FB)               += fbdev.o
+diff --git a/arch/x86/xen/Makefile b/arch/x86/xen/Makefile
+index 96ab2c09cb68..cfc61de257ff 100644
+--- a/arch/x86/xen/Makefile
++++ b/arch/x86/xen/Makefile
+@@ -1,3 +1,4 @@
++KCOV_INSTRUMENT := n
+ ifdef CONFIG_FUNCTION_TRACER
+ # Do not profile debug and lowlevel utilities
+ CFLAGS_REMOVE_spinlock.o = -pg
+diff --git a/drivers/firmware/efi/libstub/Makefile b/drivers/firmware/efi/libstub/Makefile
+new file mode 100644
+index 000000000000..da99bbb74aeb
+--- /dev/null
++++ b/drivers/firmware/efi/libstub/Makefile
+@@ -0,0 +1,83 @@
++#
++# The stub may be linked into the kernel proper or into a separate boot binary,
++# but in either case, it executes before the kernel does (with MMU disabled) so
++# things like ftrace and stack-protector are likely to cause trouble if left
++# enabled, even if doing so doesn't break the build.
++#
++cflags-$(CONFIG_X86_32)		:= -march=i386
++cflags-$(CONFIG_X86_64)		:= -mcmodel=small
++cflags-$(CONFIG_X86)		+= -m$(BITS) -D__KERNEL__ $(LINUX_INCLUDE) -O2 \
++				   -fPIC -fno-strict-aliasing -mno-red-zone \
++				   -mno-mmx -mno-sse
++
++cflags-$(CONFIG_ARM64)		:= $(subst -pg,,$(KBUILD_CFLAGS))
++cflags-$(CONFIG_ARM)		:= $(subst -pg,,$(KBUILD_CFLAGS)) \
++				   -fno-builtin -fpic -mno-single-pic-base
++
++cflags-$(CONFIG_EFI_ARMSTUB)	+= -I$(srctree)/scripts/dtc/libfdt
++
++KBUILD_CFLAGS			:= $(cflags-y) -DDISABLE_BRANCH_PROFILING \
++				   $(call cc-option,-ffreestanding) \
++				   $(call cc-option,-fno-stack-protector)
++
++GCOV_PROFILE			:= n
++KASAN_SANITIZE			:= n
++UBSAN_SANITIZE			:= n
++OBJECT_FILES_NON_STANDARD	:= y
++
++# Prevents link failures: __sanitizer_cov_trace_pc() is not linked in.
++KCOV_INSTRUMENT			:= n
++
++lib-y				:= efi-stub-helper.o
++
++# include the stub's generic dependencies from lib/ when building for ARM/arm64
++arm-deps := fdt_rw.c fdt_ro.c fdt_wip.c fdt.c fdt_empty_tree.c fdt_sw.c sort.c
++
++$(obj)/lib-%.o: $(srctree)/lib/%.c FORCE
++	$(call if_changed_rule,cc_o_c)
++
++lib-$(CONFIG_EFI_ARMSTUB)	+= arm-stub.o fdt.o string.o \
++				   $(patsubst %.c,lib-%.o,$(arm-deps))
++
++lib-$(CONFIG_ARM)		+= arm32-stub.o
++lib-$(CONFIG_ARM64)		+= arm64-stub.o random.o
++CFLAGS_arm64-stub.o 		:= -DTEXT_OFFSET=$(TEXT_OFFSET)
++
++#
++# arm64 puts the stub in the kernel proper, which will unnecessarily retain all
++# code indefinitely unless it is annotated as __init/__initdata/__initconst etc.
++# So let's apply the __init annotations at the section level, by prefixing
++# the section names directly. This will ensure that even all the inline string
++# literals are covered.
++# The fact that the stub and the kernel proper are essentially the same binary
++# also means that we need to be extra careful to make sure that the stub does
++# not rely on any absolute symbol references, considering that the virtual
++# kernel mapping that the linker uses is not active yet when the stub is
++# executing. So build all C dependencies of the EFI stub into libstub, and do
++# a verification pass to see if any absolute relocations exist in any of the
++# object files.
++#
++extra-$(CONFIG_EFI_ARMSTUB)	:= $(lib-y)
++lib-$(CONFIG_EFI_ARMSTUB)	:= $(patsubst %.o,%.stub.o,$(lib-y))
++
++STUBCOPY_FLAGS-y		:= -R .debug* -R *ksymtab* -R *kcrctab*
++STUBCOPY_FLAGS-$(CONFIG_ARM64)	+= --prefix-alloc-sections=.init \
++				   --prefix-symbols=__efistub_
++STUBCOPY_RELOC-$(CONFIG_ARM64)	:= R_AARCH64_ABS
++
++$(obj)/%.stub.o: $(obj)/%.o FORCE
++	$(call if_changed,stubcopy)
++
++quiet_cmd_stubcopy = STUBCPY $@
++      cmd_stubcopy = if $(OBJCOPY) $(STUBCOPY_FLAGS-y) $< $@; then	\
++		     $(OBJDUMP) -r $@ | grep $(STUBCOPY_RELOC-y)	\
++		     && (echo >&2 "$@: absolute symbol references not allowed in the EFI stub"; \
++			 rm -f $@; /bin/false); else /bin/false; fi
++
++#
++# ARM discards the .data section because it disallows r/w data in the
++# decompressor. So move our .data to .data.efistub, which is preserved
++# explicitly by the decompressor linker script.
++#
++STUBCOPY_FLAGS-$(CONFIG_ARM)	+= --rename-section .data=.data.efistub
++STUBCOPY_RELOC-$(CONFIG_ARM)	:= R_ARM_ABS
+diff --git a/drivers/gpu/drm/amd/display/Kconfig b/drivers/gpu/drm/amd/display/Kconfig
+new file mode 100644
+index 000000000000..ed654a76c76a
+--- /dev/null
++++ b/drivers/gpu/drm/amd/display/Kconfig
+@@ -0,0 +1,26 @@
++menu "Display Engine Configuration"
++	depends on DRM && DRM_AMDGPU
++
++config DRM_AMD_DC
++	bool "AMD DC - Enable new display engine"
++	default y
++	select DRM_AMD_DC_DCN1_0 if X86 && !(KCOV_INSTRUMENT_ALL && KCOV_ENABLE_COMPARISONS)
++	help
++	  Choose this option if you want to use the new display engine
++	  support for AMDGPU. This adds required support for Vega and
++	  Raven ASICs.
++
++config DRM_AMD_DC_DCN1_0
++	def_bool n
++	help
++	  RV family support for display engine
++
++config DEBUG_KERNEL_DC
++	bool "Enable kgdb break in DC"
++	depends on DRM_AMD_DC
++	help
++	  Choose this option
++	  if you want to hit
++	  kdgb_break in assert.
++
++endmenu
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index c235d5b68311..5ae8fdd2a62d 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -53,3 +53,5 @@ obj-$(CONFIG_INTEL_MEI)		+= mei/
+ obj-$(CONFIG_VMWARE_VMCI)	+= vmw_vmci/
+ obj-$(CONFIG_LATTICE_ECP3_CONFIG)	+= lattice-ecp3-config.o
+ obj-$(CONFIG_SRAM)		+= sram.o
++
++KCOV_INSTRUMENT_lkdtm_rodata.o := n
+diff --git a/include/linux/compiler.h b/include/linux/compiler.h
+index a2ce6f8871c4..b81983eb72bb 100644
+--- a/include/linux/compiler.h
++++ b/include/linux/compiler.h
+@@ -179,6 +179,73 @@ void ftrace_likely_update(struct ftrace_branch_data *f, int val, int expect);
+ # define __UNIQUE_ID(prefix) __PASTE(__PASTE(__UNIQUE_ID_, prefix), __LINE__)
+ #endif
+ 
++/*
++#if defined(__i386__) || defined(__x86_64__) || defined(__s390x__)
++#define smp_wmb() barrier()
++#else
++#define smp_wmb() smp_release()
++#endif
++
++#ifdef __alpha__
++#define smp_read_barrier_depends() smp_acquire()
++#else
++#define smp_read_barrier_depends() do {} while(0)
++#endif
++
++#if defined(__i386__) || defined(__x86_64__) || defined(__s390x__)
++#define smp_wmb() barrier()
++#else
++#define smp_wmb() smp_release()
++#endif
++*/
++
++static __always_inline
++void __read_once_size(const volatile void *p, void *res, int size)
++{
++        switch (size) {                                                 \
++        case 1: *(unsigned char *)res = *(volatile unsigned char *)p; break;              \
++        case 2: *(unsigned short *)res = *(volatile unsigned short *)p; break;            \
++        case 4: *(unsigned int *)res = *(volatile unsigned int *)p; break;            \
++        case 8: *(unsigned long long *)res = *(volatile unsigned long long *)p; break;            \
++        default:                                                        \
++                barrier();                                              \
++                __builtin_memcpy((void *)res, (const void *)p, size);   \
++                barrier();                                              \
++        }                                                               \
++}
++
++static __always_inline void __write_once_size(volatile void *p, void *res, int size)
++{
++	switch (size) {
++	case 1: *(volatile unsigned char *)p = *(unsigned char *)res; break;
++	case 2: *(volatile unsigned short *)p = *(unsigned short *)res; break;
++	case 4: *(volatile unsigned int *)p = *(unsigned int *)res; break;
++	case 8: *(volatile unsigned long long *)p = *(unsigned long long *)res; break;
++	default:
++		barrier();
++		__builtin_memcpy((void *)p, (const void *)res, size);
++		barrier();
++	}
++}
++
++#define READ_ONCE(x) \
++({									\
++	union { typeof(x) __val; char __c[1]; } __u;			\
++	__read_once_size(&(x), __u.__c, sizeof(x));		\
++	smp_read_barrier_depends(); /* Enforce dependency ordering from x */ \
++	__u.__val;							\
++})
++
++#define WRITE_ONCE(x, val) \
++({							\
++	union { typeof(x) __val; char __c[1]; } __u =	\
++		{ .__val = (typeof(x)) (val) }; \
++	__write_once_size(&(x), __u.__c, sizeof(x));	\
++	__u.__val;					\
++})
++
++
++
+ #endif /* __KERNEL__ */
+ 
+ #endif /* __ASSEMBLY__ */
+diff --git a/include/linux/kcov.h b/include/linux/kcov.h
+new file mode 100644
+index 000000000000..e1c44b67de2a
+--- /dev/null
++++ b/include/linux/kcov.h
+@@ -0,0 +1,47 @@
++#ifndef _LINUX_KCOV_H
++#define _LINUX_KCOV_H
++
++#include <uapi/linux/kcov.h>
++
++struct task_struct;
++
++#ifdef CONFIG_KCOV
++
++enum kcov_mode {
++	/* Coverage collection is not enabled yet. */
++	KCOV_MODE_DISABLED = 0,
++	/* KCOV was initialized, but tracing mode hasn't been chosen yet. */
++	KCOV_MODE_INIT = 1,
++	/*
++	 * Tracing coverage collection mode.
++	 * Covered PCs are collected in a per-task buffer.
++	 */
++	KCOV_MODE_TRACE_PC = 2,
++	/* Collecting comparison operands mode. */
++	KCOV_MODE_TRACE_CMP = 3,
++};
++
++#define KCOV_IN_CTXSW	(1 << 30)
++
++void kcov_task_init(struct task_struct *t);
++void kcov_task_exit(struct task_struct *t);
++
++#define kcov_prepare_switch(t)			\
++do {						\
++	(t)->kcov_mode |= KCOV_IN_CTXSW;	\
++} while (0)
++
++#define kcov_finish_switch(t)			\
++do {						\
++	(t)->kcov_mode &= ~KCOV_IN_CTXSW;	\
++} while (0)
++
++#else
++
++static inline void kcov_task_init(struct task_struct *t) {}
++static inline void kcov_task_exit(struct task_struct *t) {}
++static inline void kcov_prepare_switch(struct task_struct *t) {}
++static inline void kcov_finish_switch(struct task_struct *t) {}
++
++#endif /* CONFIG_KCOV */
++#endif /* _LINUX_KCOV_H */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 7728941e7ddc..4a6213031be9 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -46,6 +46,7 @@ struct sched_param {
+ #include <linux/resource.h>
+ #include <linux/timer.h>
+ #include <linux/hrtimer.h>
++#include <linux/kcov.h>
+ #include <linux/task_io_accounting.h>
+ #include <linux/latencytop.h>
+ #include <linux/cred.h>
+@@ -1405,6 +1406,19 @@ struct task_struct {
+ 	/* bitmask and counter of trace recursion */
+ 	unsigned long trace_recursion;
+ #endif /* CONFIG_TRACING */
++#ifdef CONFIG_KCOV
++	/* Coverage collection mode enabled for this task (0 if disabled): */
++	unsigned int			kcov_mode;
++
++	/* Size of the kcov_area: */
++	unsigned int			kcov_size;
++
++	/* Buffer for coverage collection: */
++	void				*kcov_area;
++
++	/* KCOV descriptor wired with this task or NULL: */
++	struct kcov			*kcov;
++#endif
+ #ifdef CONFIG_MEMCG /* memcg uses this to do batch job */
+ 	struct memcg_batch_info {
+ 		int do_batch;	/* incremented when batch uncharge started */
+diff --git a/include/uapi/linux/kcov.h b/include/uapi/linux/kcov.h
+new file mode 100644
+index 000000000000..33b826b9946e
+--- /dev/null
++++ b/include/uapi/linux/kcov.h
+@@ -0,0 +1,34 @@
++#ifndef _LINUX_KCOV_IOCTLS_H
++#define _LINUX_KCOV_IOCTLS_H
++
++#include <linux/types.h>
++
++#define KCOV_INIT_TRACE			_IOR('c', 1, unsigned long)
++#define KCOV_ENABLE			_IO('c', 100)
++#define KCOV_DISABLE			_IO('c', 101)
++
++enum {
++	/*
++	 * Tracing coverage collection mode.
++	 * Covered PCs are collected in a per-task buffer.
++	 * In new KCOV version the mode is chosen by calling
++	 * ioctl(fd, KCOV_ENABLE, mode). In older versions the mode argument
++	 * was supposed to be 0 in such a call. So, for reasons of backward
++	 * compatibility, we have chosen the value KCOV_TRACE_PC to be 0.
++	 */
++	KCOV_TRACE_PC = 0,
++	/* Collecting comparison operands mode. */
++	KCOV_TRACE_CMP = 1,
++};
++
++/*
++ * The format for the types of collected comparisons.
++ *
++ * Bit 0 shows whether one of the arguments is a compile-time constant.
++ * Bits 1 & 2 contain log2 of the argument size, up to 8 bytes.
++ */
++#define KCOV_CMP_CONST          (1 << 0)
++#define KCOV_CMP_SIZE(n)        ((n) << 1)
++#define KCOV_CMP_MASK           KCOV_CMP_SIZE(3)
++
++#endif /* _LINUX_KCOV_IOCTLS_H */
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 271fd3119af9..01fc07988df6 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -2,6 +2,7 @@
+ # Makefile for the linux kernel.
+ #
+ 
++KCOV_INSTRUMENT := n
+ obj-y     = fork.o exec_domain.o panic.o printk.o \
+ 	    cpu.o exit.o itimer.o time.o softirq.o resource.o \
+ 	    sysctl.o sysctl_binary.o capability.o ptrace.o timer.o user.o \
+@@ -74,6 +75,7 @@ obj-$(CONFIG_AUDITSYSCALL) += auditsc.o
+ obj-$(CONFIG_AUDIT_WATCH) += audit_watch.o
+ obj-$(CONFIG_AUDIT_TREE) += audit_tree.o
+ obj-$(CONFIG_GCOV_KERNEL) += gcov/
++obj-$(CONFIG_KCOV) += kcov.o
+ obj-$(CONFIG_KPROBES) += kprobes.o
+ obj-$(CONFIG_KGDB) += debug/
+ obj-$(CONFIG_DETECT_HUNG_TASK) += hung_task.o
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 717efbd7cb72..b258f5266000 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -53,6 +53,7 @@
+ #include <linux/oom.h>
+ #include <linux/writeback.h>
+ #include <linux/shm.h>
++#include <linux/kcov.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/unistd.h>
+@@ -718,6 +719,7 @@ void do_exit(long code)
+ 	int group_dead;
+ 
+ 	profile_task_exit(tsk);
++	kcov_task_exit(tsk);
+ 
+ 	WARN_ON(blk_needs_flush_plug(tsk));
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 612e78d82194..0c3e83a92157 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -335,6 +335,8 @@ static struct task_struct *dup_task_struct(struct task_struct *orig)
+ 
+ 	account_kernel_stack(ti, 1);
+ 
++	kcov_task_init(tsk);
++
+ 	return tsk;
+ 
+ free_ti:
+diff --git a/kernel/kcov.c b/kernel/kcov.c
+new file mode 100644
+index 000000000000..08f8c967bfbd
+--- /dev/null
++++ b/kernel/kcov.c
+@@ -0,0 +1,454 @@
++#define pr_fmt(fmt) "kcov: " fmt
++
++#define DISABLE_BRANCH_PROFILING
++#include <linux/atomic.h>
++#include <linux/compiler.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/types.h>
++#include <linux/file.h>
++#include <linux/fs.h>
++#include <linux/init.h>
++#include <linux/mm.h>
++#include <linux/preempt.h>
++#include <linux/printk.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/vmalloc.h>
++#include <linux/debugfs.h>
++#include <linux/uaccess.h>
++#include <linux/kcov.h>
++#include <asm/setup.h>
++
++/* Number of 64-bit words written per one comparison: */
++#define KCOV_WORDS_PER_CMP 4
++
++/*
++ * kcov descriptor (one per opened debugfs file).
++ * State transitions of the descriptor:
++ *  - initial state after open()
++ *  - then there must be a single ioctl(KCOV_INIT_TRACE) call
++ *  - then, mmap() call (several calls are allowed but not useful)
++ *  - then, ioctl(KCOV_ENABLE, arg), where arg is
++ *	KCOV_TRACE_PC - to trace only the PCs
++ *	or
++ *	KCOV_TRACE_CMP - to trace only the comparison operands
++ *  - then, ioctl(KCOV_DISABLE) to disable the task.
++ * Enabling/disabling ioctls can be repeated (only one task a time allowed).
++ */
++struct kcov {
++	/*
++	 * Reference counter. We keep one for:
++	 *  - opened file descriptor
++	 *  - task with enabled coverage (we can't unwire it from another task)
++	 */
++	atomic_t		refcount;
++	/* The lock protects mode, size, area and t. */
++	spinlock_t		lock;
++	enum kcov_mode		mode;
++	/* Size of arena (in long's for KCOV_MODE_TRACE). */
++	unsigned		size;
++	/* Coverage buffer shared with user space. */
++	void			*area;
++	/* Task for which we collect coverage, or NULL. */
++	struct task_struct	*t;
++};
++
++static notrace bool check_kcov_mode(enum kcov_mode needed_mode, struct task_struct *t)
++{
++	unsigned int mode;
++
++	/*
++	 * We are interested in code coverage as a function of a syscall inputs,
++	 * so we ignore code executed in interrupts.
++	 */
++	int in_task = preempt_count() != 0;
++	if (in_task)
++		return false;
++	mode = READ_ONCE(t->kcov_mode);
++	/*
++	 * There is some code that runs in interrupts but for which
++	 * in_interrupt() returns false (e.g. preempt_schedule_irq()).
++	 * READ_ONCE()/barrier() effectively provides load-acquire wrt
++	 * interrupts, there are paired barrier()/WRITE_ONCE() in
++	 * kcov_ioctl_locked().
++	 */
++	barrier();
++	return mode == needed_mode;
++}
++
++static notrace unsigned long canonicalize_ip(unsigned long ip)
++{
++#ifdef CONFIG_RANDOMIZE_BASE
++	ip -= kaslr_offset();
++#endif
++	return ip;
++}
++
++/*
++ * Entry point from instrumented code.
++ * This is called once per basic-block/edge.
++ */
++void notrace __sanitizer_cov_trace_pc(void)
++{
++	struct task_struct *t;
++	unsigned long *area;
++	unsigned long ip = canonicalize_ip(_RET_IP_);
++	unsigned long pos;
++
++	t = current;
++	if (!check_kcov_mode(KCOV_MODE_TRACE_PC, t))
++		return;
++
++	area = t->kcov_area;
++	/* The first 64-bit word is the number of subsequent PCs. */
++	pos = READ_ONCE(area[0]) + 1;
++	if (likely(pos < t->kcov_size)) {
++		area[pos] = ip;
++		WRITE_ONCE(area[0], pos);
++	}
++}
++EXPORT_SYMBOL(__sanitizer_cov_trace_pc);
++
++#ifdef CONFIG_KCOV_ENABLE_COMPARISONS
++static void write_comp_data(u64 type, u64 arg1, u64 arg2, u64 ip)
++{
++	struct task_struct *t;
++	u64 *area;
++	u64 count, start_index, end_pos, max_pos;
++
++	t = current;
++	if (!check_kcov_mode(KCOV_MODE_TRACE_CMP, t))
++		return;
++
++	ip = canonicalize_ip(ip);
++
++	/*
++	 * We write all comparison arguments and types as u64.
++	 * The buffer was allocated for t->kcov_size unsigned longs.
++	 */
++	area = (u64 *)t->kcov_area;
++	max_pos = t->kcov_size * sizeof(unsigned long);
++
++	count = READ_ONCE(area[0]);
++
++	/* Every record is KCOV_WORDS_PER_CMP 64-bit words. */
++	start_index = 1 + count * KCOV_WORDS_PER_CMP;
++	end_pos = (start_index + KCOV_WORDS_PER_CMP) * sizeof(u64);
++	if (likely(end_pos <= max_pos)) {
++		area[start_index] = type;
++		area[start_index + 1] = arg1;
++		area[start_index + 2] = arg2;
++		area[start_index + 3] = ip;
++		WRITE_ONCE(area[0], count + 1);
++	}
++}
++
++void notrace __sanitizer_cov_trace_cmp1(u8 arg1, u8 arg2)
++{
++	write_comp_data(KCOV_CMP_SIZE(0), arg1, arg2, _RET_IP_);
++}
++EXPORT_SYMBOL(__sanitizer_cov_trace_cmp1);
++
++void notrace __sanitizer_cov_trace_cmp2(u16 arg1, u16 arg2)
++{
++	write_comp_data(KCOV_CMP_SIZE(1), arg1, arg2, _RET_IP_);
++}
++EXPORT_SYMBOL(__sanitizer_cov_trace_cmp2);
++
++void notrace __sanitizer_cov_trace_cmp4(u32 arg1, u32 arg2)
++{
++	write_comp_data(KCOV_CMP_SIZE(2), arg1, arg2, _RET_IP_);
++}
++EXPORT_SYMBOL(__sanitizer_cov_trace_cmp4);
++
++void notrace __sanitizer_cov_trace_cmp8(u64 arg1, u64 arg2)
++{
++	write_comp_data(KCOV_CMP_SIZE(3), arg1, arg2, _RET_IP_);
++}
++EXPORT_SYMBOL(__sanitizer_cov_trace_cmp8);
++
++void notrace __sanitizer_cov_trace_const_cmp1(u8 arg1, u8 arg2)
++{
++	write_comp_data(KCOV_CMP_SIZE(0) | KCOV_CMP_CONST, arg1, arg2,
++			_RET_IP_);
++}
++EXPORT_SYMBOL(__sanitizer_cov_trace_const_cmp1);
++
++void notrace __sanitizer_cov_trace_const_cmp2(u16 arg1, u16 arg2)
++{
++	write_comp_data(KCOV_CMP_SIZE(1) | KCOV_CMP_CONST, arg1, arg2,
++			_RET_IP_);
++}
++EXPORT_SYMBOL(__sanitizer_cov_trace_const_cmp2);
++
++void notrace __sanitizer_cov_trace_const_cmp4(u32 arg1, u32 arg2)
++{
++	write_comp_data(KCOV_CMP_SIZE(2) | KCOV_CMP_CONST, arg1, arg2,
++			_RET_IP_);
++}
++EXPORT_SYMBOL(__sanitizer_cov_trace_const_cmp4);
++
++void notrace __sanitizer_cov_trace_const_cmp8(u64 arg1, u64 arg2)
++{
++	write_comp_data(KCOV_CMP_SIZE(3) | KCOV_CMP_CONST, arg1, arg2,
++			_RET_IP_);
++}
++EXPORT_SYMBOL(__sanitizer_cov_trace_const_cmp8);
++
++void notrace __sanitizer_cov_trace_switch(u64 val, u64 *cases)
++{
++	u64 i;
++	u64 count = cases[0];
++	u64 size = cases[1];
++	u64 type = KCOV_CMP_CONST;
++
++	switch (size) {
++	case 8:
++		type |= KCOV_CMP_SIZE(0);
++		break;
++	case 16:
++		type |= KCOV_CMP_SIZE(1);
++		break;
++	case 32:
++		type |= KCOV_CMP_SIZE(2);
++		break;
++	case 64:
++		type |= KCOV_CMP_SIZE(3);
++		break;
++	default:
++		return;
++	}
++	for (i = 0; i < count; i++)
++		write_comp_data(type, cases[i + 2], val, _RET_IP_);
++}
++EXPORT_SYMBOL(__sanitizer_cov_trace_switch);
++#endif /* ifdef CONFIG_KCOV_ENABLE_COMPARISONS */
++
++static void kcov_get(struct kcov *kcov)
++{
++	atomic_inc(&kcov->refcount);
++}
++
++static void kcov_put(struct kcov *kcov)
++{
++	if (atomic_dec_and_test(&kcov->refcount)) {
++		vfree(kcov->area);
++		kfree(kcov);
++	}
++}
++
++void kcov_task_init(struct task_struct *t)
++{
++	WRITE_ONCE(t->kcov_mode, KCOV_MODE_DISABLED);
++	barrier();
++	t->kcov_size = 0;
++	t->kcov_area = NULL;
++	t->kcov = NULL;
++}
++
++void kcov_task_exit(struct task_struct *t)
++{
++	struct kcov *kcov;
++
++	kcov = t->kcov;
++	if (kcov == NULL)
++		return;
++	spin_lock(&kcov->lock);
++	if (WARN_ON(kcov->t != t)) {
++		spin_unlock(&kcov->lock);
++		return;
++	}
++	/* Just to not leave dangling references behind. */
++	kcov_task_init(t);
++	kcov->t = NULL;
++	kcov->mode = KCOV_MODE_INIT;
++	spin_unlock(&kcov->lock);
++	kcov_put(kcov);
++}
++
++static int kcov_mmap(struct file *filep, struct vm_area_struct *vma)
++{
++	int res = 0;
++	void *area;
++	struct kcov *kcov = vma->vm_file->private_data;
++	unsigned long size, off;
++	struct page *page;
++
++	area = vmalloc_user(vma->vm_end - vma->vm_start);
++	if (!area)
++		return -ENOMEM;
++
++	spin_lock(&kcov->lock);
++	size = kcov->size * sizeof(unsigned long);
++	if (kcov->mode != KCOV_MODE_INIT || vma->vm_pgoff != 0 ||
++	    vma->vm_end - vma->vm_start != size) {
++		res = -EINVAL;
++		goto exit;
++	}
++	if (!kcov->area) {
++		kcov->area = area;
++		vma->vm_flags |= VM_DONTEXPAND;
++		spin_unlock(&kcov->lock);
++		for (off = 0; off < size; off += PAGE_SIZE) {
++			page = vmalloc_to_page(kcov->area + off);
++			if (vm_insert_page(vma, vma->vm_start + off, page))
++				WARN_ONCE(1, "vm_insert_page() failed");
++		}
++		return 0;
++	}
++exit:
++	spin_unlock(&kcov->lock);
++	vfree(area);
++	return res;
++}
++
++static int kcov_open(struct inode *inode, struct file *filep)
++{
++	struct kcov *kcov;
++
++	kcov = kzalloc(sizeof(*kcov), GFP_KERNEL);
++	if (!kcov)
++		return -ENOMEM;
++	kcov->mode = KCOV_MODE_DISABLED;
++	atomic_set(&kcov->refcount, 1);
++	spin_lock_init(&kcov->lock);
++	filep->private_data = kcov;
++	return nonseekable_open(inode, filep);
++}
++
++static int kcov_close(struct inode *inode, struct file *filep)
++{
++	kcov_put(filep->private_data);
++	return 0;
++}
++
++/*
++ * Fault in a lazily-faulted vmalloc area before it can be used by
++ * __santizer_cov_trace_pc(), to avoid recursion issues if any code on the
++ * vmalloc fault handling path is instrumented.
++ */
++static void kcov_fault_in_area(struct kcov *kcov)
++{
++	unsigned long stride = PAGE_SIZE / sizeof(unsigned long);
++	unsigned long *area = kcov->area;
++	unsigned long offset;
++
++	for (offset = 0; offset < kcov->size; offset += stride)
++		READ_ONCE(area[offset]);
++}
++
++static int kcov_ioctl_locked(struct kcov *kcov, unsigned int cmd,
++			     unsigned long arg)
++{
++	struct task_struct *t;
++	unsigned long size, unused;
++
++	switch (cmd) {
++	case KCOV_INIT_TRACE:
++		/*
++		 * Enable kcov in trace mode and setup buffer size.
++		 * Must happen before anything else.
++		 */
++		if (kcov->mode != KCOV_MODE_DISABLED)
++			return -EBUSY;
++		/*
++		 * Size must be at least 2 to hold current position and one PC.
++		 * Later we allocate size * sizeof(unsigned long) memory,
++		 * that must not overflow.
++		 */
++		size = arg;
++		if (size < 2 || size > INT_MAX / sizeof(unsigned long))
++			return -EINVAL;
++		kcov->size = size;
++		kcov->mode = KCOV_MODE_INIT;
++		return 0;
++	case KCOV_ENABLE:
++		/*
++		 * Enable coverage for the current task.
++		 * At this point user must have been enabled trace mode,
++		 * and mmapped the file. Coverage collection is disabled only
++		 * at task exit or voluntary by KCOV_DISABLE. After that it can
++		 * be enabled for another task.
++		 */
++		if (kcov->mode != KCOV_MODE_INIT || !kcov->area)
++			return -EINVAL;
++		t = current;
++		if (kcov->t != NULL || t->kcov != NULL)
++			return -EBUSY;
++		if (arg == KCOV_TRACE_PC)
++			kcov->mode = KCOV_MODE_TRACE_PC;
++		else if (arg == KCOV_TRACE_CMP)
++#ifdef CONFIG_KCOV_ENABLE_COMPARISONS
++			kcov->mode = KCOV_MODE_TRACE_CMP;
++#else
++		return -ENOTSUPP;
++#endif
++		else
++			return -EINVAL;
++		kcov_fault_in_area(kcov);
++		/* Cache in task struct for performance. */
++		t->kcov_size = kcov->size;
++		t->kcov_area = kcov->area;
++		/* See comment in check_kcov_mode(). */
++		barrier();
++		WRITE_ONCE(t->kcov_mode, kcov->mode);
++		t->kcov = kcov;
++		kcov->t = t;
++		/* This is put either in kcov_task_exit() or in KCOV_DISABLE. */
++		kcov_get(kcov);
++		return 0;
++	case KCOV_DISABLE:
++		/* Disable coverage for the current task. */
++		unused = arg;
++		if (unused != 0 || current->kcov != kcov)
++			return -EINVAL;
++		t = current;
++		if (WARN_ON(kcov->t != t))
++			return -EINVAL;
++		kcov_task_init(t);
++		kcov->t = NULL;
++		kcov->mode = KCOV_MODE_INIT;
++		kcov_put(kcov);
++		return 0;
++	default:
++		return -ENOTTY;
++	}
++}
++
++static long kcov_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
++{
++	struct kcov *kcov;
++	int res;
++
++	kcov = filep->private_data;
++	spin_lock(&kcov->lock);
++	res = kcov_ioctl_locked(kcov, cmd, arg);
++	spin_unlock(&kcov->lock);
++	return res;
++}
++
++static const struct file_operations kcov_fops = {
++	.open		= kcov_open,
++	.unlocked_ioctl	= kcov_ioctl,
++	.compat_ioctl	= kcov_ioctl,
++	.mmap		= kcov_mmap,
++	.release        = kcov_close,
++};
++
++static int __init kcov_init(void)
++{
++	/*
++	 * The kcov debugfs file won't ever get removed and thus,
++	 * there is no need to protect it against removal races. The
++	 * use of debugfs_create_file_unsafe() is actually safe here.
++	 */
++	if (!debugfs_create_file("kcov", 0600, NULL, NULL, &kcov_fops)) {
++		pr_err("failed to create kcov in debugfs\n");
++		return -ENOMEM;
++	}
++	return 0;
++}
++
++device_initcall(kcov_init);
+diff --git a/kernel/locking/Makefile b/kernel/locking/Makefile
+new file mode 100644
+index 000000000000..31322a4275cd
+--- /dev/null
++++ b/kernel/locking/Makefile
+@@ -0,0 +1,31 @@
++# Any varying coverage in these files is non-deterministic
++# and is generally not a function of system call inputs.
++KCOV_INSTRUMENT		:= n
++
++obj-y += mutex.o semaphore.o rwsem.o percpu-rwsem.o
++
++ifdef CONFIG_FUNCTION_TRACER
++CFLAGS_REMOVE_lockdep.o = $(CC_FLAGS_FTRACE)
++CFLAGS_REMOVE_lockdep_proc.o = $(CC_FLAGS_FTRACE)
++CFLAGS_REMOVE_mutex-debug.o = $(CC_FLAGS_FTRACE)
++CFLAGS_REMOVE_rtmutex-debug.o = $(CC_FLAGS_FTRACE)
++endif
++
++obj-$(CONFIG_DEBUG_MUTEXES) += mutex-debug.o
++obj-$(CONFIG_LOCKDEP) += lockdep.o
++ifeq ($(CONFIG_PROC_FS),y)
++obj-$(CONFIG_LOCKDEP) += lockdep_proc.o
++endif
++obj-$(CONFIG_SMP) += spinlock.o
++obj-$(CONFIG_LOCK_SPIN_ON_OWNER) += osq_lock.o
++obj-$(CONFIG_SMP) += lglock.o
++obj-$(CONFIG_PROVE_LOCKING) += spinlock.o
++obj-$(CONFIG_QUEUED_SPINLOCKS) += qspinlock.o
++obj-$(CONFIG_RT_MUTEXES) += rtmutex.o
++obj-$(CONFIG_DEBUG_RT_MUTEXES) += rtmutex-debug.o
++obj-$(CONFIG_DEBUG_SPINLOCK) += spinlock.o
++obj-$(CONFIG_DEBUG_SPINLOCK) += spinlock_debug.o
++obj-$(CONFIG_RWSEM_GENERIC_SPINLOCK) += rwsem-spinlock.o
++obj-$(CONFIG_RWSEM_XCHGADD_ALGORITHM) += rwsem-xadd.o
++obj-$(CONFIG_QUEUED_RWLOCKS) += qrwlock.o
++obj-$(CONFIG_LOCK_TORTURE_TEST) += locktorture.o
+diff --git a/kernel/rcu/Makefile b/kernel/rcu/Makefile
+new file mode 100644
+index 000000000000..032b2c015beb
+--- /dev/null
++++ b/kernel/rcu/Makefile
+@@ -0,0 +1,11 @@
++# Any varying coverage in these files is non-deterministic
++# and is generally not a function of system call inputs.
++KCOV_INSTRUMENT := n
++
++obj-y += update.o sync.o
++obj-$(CONFIG_SRCU) += srcu.o
++obj-$(CONFIG_RCU_TORTURE_TEST) += rcutorture.o
++obj-$(CONFIG_TREE_RCU) += tree.o
++obj-$(CONFIG_PREEMPT_RCU) += tree.o
++obj-$(CONFIG_TREE_RCU_TRACE) += tree_trace.o
++obj-$(CONFIG_TINY_RCU) += tiny.o
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index deaf90e4a1de..e85375dd916f 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -2,6 +2,10 @@ ifdef CONFIG_FUNCTION_TRACER
+ CFLAGS_REMOVE_clock.o = -pg
+ endif
+ 
++# These files are disabled because they produce non-interesting flaky coverage
++# that is not a function of syscall inputs. E.g. involuntary context switches.
++KCOV_INSTRUMENT := n
++
+ ifneq ($(CONFIG_SCHED_OMIT_FRAME_POINTER),y)
+ # According to Alan Modra <alan@linuxcare.com.au>, the -fno-omit-frame-pointer is
+ # needed for x86 only.  Why this used to be enabled for all architectures is beyond
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 0892cfa0fe34..acbc9160c5f1 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -74,6 +74,8 @@
+ #include <linux/binfmts.h>
+ #include <linux/context_tracking.h>
+ 
++#include <linux/kcov.h>
++
+ #include <asm/switch_to.h>
+ #include <asm/tlb.h>
+ #include <asm/irq_regs.h>
+@@ -1938,6 +1940,7 @@ static void finish_task_switch(struct rq *rq, struct task_struct *prev)
+ 	perf_event_task_sched_in(prev, current);
+ 	finish_lock_switch(rq, prev);
+ 	finish_arch_post_lock_switch();
++	kcov_finish_switch(current);
+ 
+ 	fire_sched_in_preempt_notifiers(current);
+ 	if (mm)
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index 74fdc5cf4adc..74a63dd72946 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -162,6 +162,38 @@ config DEBUG_KERNEL
+ 	  Say Y here if you are developing drivers or trying to debug and
+ 	  identify kernel problems.
+ 
++config ARCH_HAS_KCOV
++	bool
++	help
++	  KCOV does not have any arch-specific code, but currently it is enabled
++	  only for x86_64. KCOV requires testing on other archs, and most likely
++	  disabling of instrumentation for some early boot code.
++
++config KCOV
++	bool "Code coverage for fuzzing"
++	depends on ARCH_HAS_KCOV
++	select DEBUG_FS
++	help
++	  KCOV exposes kernel code coverage information in a form suitable
++	  for coverage-guided fuzzing (randomized testing).
++
++	  If RANDOMIZE_BASE is enabled, PC values will not be stable across
++	  different machines and across reboots. If you need stable PC values,
++	  disable RANDOMIZE_BASE.
++
++	  For more details, see Documentation/kcov.txt.
++
++config KCOV_INSTRUMENT_ALL
++	bool "Instrument all code by default"
++	depends on KCOV
++	default y if KCOV
++	help
++	  If you are doing generic system call fuzzing (like e.g. syzkaller),
++	  then you will want to instrument the whole kernel and you should
++	  say y here. If you are doing more targeted fuzzing (like e.g.
++	  filesystem fuzzing with AFL) then you will want to enable coverage
++	  for more specific subsets of files, and should say n here.
++
+ config DEBUG_SHIRQ
+ 	bool "Debug shared IRQ handlers"
+ 	depends on DEBUG_KERNEL && GENERIC_HARDIRQS
+diff --git a/lib/Makefile b/lib/Makefile
+index 9efe480b975e..4d1211df45b6 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -7,6 +7,18 @@ ORIG_CFLAGS := $(KBUILD_CFLAGS)
+ KBUILD_CFLAGS = $(subst -pg,,$(ORIG_CFLAGS))
+ endif
+ 
++# These files are disabled because they produce lots of non-interesting and/or
++# flaky coverage that is not a function of syscall inputs. For example,
++# rbtree can be global and individual rotations don't correlate with inputs.
++KCOV_INSTRUMENT_string.o := n
++KCOV_INSTRUMENT_rbtree.o := n
++KCOV_INSTRUMENT_list_debug.o := n
++KCOV_INSTRUMENT_debugobjects.o := n
++KCOV_INSTRUMENT_dynamic_debug.o := n
++# Kernel does not boot if we instrument this file as it uses custom calling
++# convention (see CONFIG_ARCH_HWEIGHT_CFLAGS).
++KCOV_INSTRUMENT_hweight.o := n
++
+ lib-y := ctype.o string.o vsprintf.o cmdline.o \
+ 	 rbtree.o radix-tree.o dump_stack.o timerqueue.o\
+ 	 idr.o int_sqrt.o extable.o \
+diff --git a/mm/Makefile b/mm/Makefile
+index 72c5acb9345f..9dc2d456ae6c 100644
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -2,6 +2,20 @@
+ # Makefile for the linux memory manager.
+ #
+ 
++# These files are disabled because they produce non-interesting and/or
++# flaky coverage that is not a function of syscall inputs. E.g. slab is out of
++# free pages, or a task is migrated between nodes.
++KCOV_INSTRUMENT_slab_common.o := n
++KCOV_INSTRUMENT_slob.o := n
++KCOV_INSTRUMENT_slab.o := n
++KCOV_INSTRUMENT_slub.o := n
++KCOV_INSTRUMENT_page_alloc.o := n
++KCOV_INSTRUMENT_debug-pagealloc.o := n
++KCOV_INSTRUMENT_kmemleak.o := n
++KCOV_INSTRUMENT_memcontrol.o := n
++KCOV_INSTRUMENT_mmzone.o := n
++KCOV_INSTRUMENT_vmstat.o := n
++
+ mmu-y			:= nommu.o
+ mmu-$(CONFIG_MMU)	:= fremap.o highmem.o madvise.o memory.o mincore.o \
+ 			   mlock.o mmap.o mprotect.o mremap.o msync.o rmap.o \
+diff --git a/mm/kasan/Makefile b/mm/kasan/Makefile
+new file mode 100644
+index 000000000000..131daadf40e4
+--- /dev/null
++++ b/mm/kasan/Makefile
+@@ -0,0 +1,10 @@
++KASAN_SANITIZE := n
++UBSAN_SANITIZE_kasan.o := n
++KCOV_INSTRUMENT := n
++
++CFLAGS_REMOVE_kasan.o = -pg
++# Function splitter causes unnecessary splits in __asan_load1/__asan_store1
++# see: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=63533
++CFLAGS_kasan.o := $(call cc-option, -fno-conserve-stack -fno-stack-protector)
++
++obj-y := kasan.o report.o kasan_init.o
+diff --git a/scripts/Makefile.gcc-plugins b/scripts/Makefile.gcc-plugins
+new file mode 100644
+index 000000000000..708c8f6a5717
+--- /dev/null
++++ b/scripts/Makefile.gcc-plugins
+@@ -0,0 +1,81 @@
++# SPDX-License-Identifier: GPL-2.0
++ifdef CONFIG_GCC_PLUGINS
++  __PLUGINCC := $(call cc-ifversion, -ge, 0408, $(HOSTCXX), $(HOSTCC))
++  PLUGINCC := $(shell $(CONFIG_SHELL) $(srctree)/scripts/gcc-plugin.sh "$(__PLUGINCC)" "$(HOSTCXX)" "$(CC)")
++
++  SANCOV_PLUGIN := -fplugin=$(objtree)/scripts/gcc-plugins/sancov_plugin.so
++
++  gcc-plugin-$(CONFIG_GCC_PLUGIN_CYC_COMPLEXITY)	+= cyc_complexity_plugin.so
++
++  gcc-plugin-$(CONFIG_GCC_PLUGIN_LATENT_ENTROPY)	+= latent_entropy_plugin.so
++  gcc-plugin-cflags-$(CONFIG_GCC_PLUGIN_LATENT_ENTROPY)	+= -DLATENT_ENTROPY_PLUGIN
++  ifdef CONFIG_GCC_PLUGIN_LATENT_ENTROPY
++    DISABLE_LATENT_ENTROPY_PLUGIN			+= -fplugin-arg-latent_entropy_plugin-disable
++  endif
++
++  ifdef CONFIG_GCC_PLUGIN_SANCOV
++      # It is needed because of the gcc-plugin.sh and gcc version checks.
++      gcc-plugin-$(CONFIG_GCC_PLUGIN_SANCOV)           += sancov_plugin.so
++
++      ifeq ($(PLUGINCC),)
++        $(warning warning: cannot use CONFIG_KCOV: -fsanitize-coverage=trace-pc is not supported by compiler)
++      endif
++  endif
++
++  gcc-plugin-$(CONFIG_GCC_PLUGIN_STRUCTLEAK)	+= structleak_plugin.so
++  gcc-plugin-cflags-$(CONFIG_GCC_PLUGIN_STRUCTLEAK_VERBOSE)	+= -fplugin-arg-structleak_plugin-verbose
++  gcc-plugin-cflags-$(CONFIG_GCC_PLUGIN_STRUCTLEAK_BYREF_ALL)	+= -fplugin-arg-structleak_plugin-byref-all
++  gcc-plugin-cflags-$(CONFIG_GCC_PLUGIN_STRUCTLEAK)	+= -DSTRUCTLEAK_PLUGIN
++
++  gcc-plugin-$(CONFIG_GCC_PLUGIN_RANDSTRUCT)	+= randomize_layout_plugin.so
++  gcc-plugin-cflags-$(CONFIG_GCC_PLUGIN_RANDSTRUCT)	+= -DRANDSTRUCT_PLUGIN
++  gcc-plugin-cflags-$(CONFIG_GCC_PLUGIN_RANDSTRUCT_PERFORMANCE)	+= -fplugin-arg-randomize_layout_plugin-performance-mode
++
++  GCC_PLUGINS_CFLAGS := $(strip $(addprefix -fplugin=$(objtree)/scripts/gcc-plugins/, $(gcc-plugin-y)) $(gcc-plugin-cflags-y))
++
++  export PLUGINCC GCC_PLUGINS_CFLAGS GCC_PLUGIN GCC_PLUGIN_SUBDIR
++  export DISABLE_LATENT_ENTROPY_PLUGIN
++
++  ifneq ($(PLUGINCC),)
++    # SANCOV_PLUGIN can be only in CFLAGS_KCOV because avoid duplication.
++    GCC_PLUGINS_CFLAGS := $(filter-out $(SANCOV_PLUGIN), $(GCC_PLUGINS_CFLAGS))
++  endif
++
++  KBUILD_CFLAGS += $(GCC_PLUGINS_CFLAGS)
++  GCC_PLUGIN := $(gcc-plugin-y)
++  GCC_PLUGIN_SUBDIR := $(gcc-plugin-subdir-y)
++endif
++
++# If plugins aren't supported, abort the build before hard-to-read compiler
++# errors start getting spewed by the main build.
++PHONY += gcc-plugins-check
++gcc-plugins-check: FORCE
++ifdef CONFIG_GCC_PLUGINS
++  ifeq ($(PLUGINCC),)
++    ifneq ($(GCC_PLUGINS_CFLAGS),)
++      # Various gccs between 4.5 and 5.1 have bugs on powerpc due to missing
++      # header files. gcc <= 4.6 doesn't work at all, gccs from 4.8 to 5.1 have
++      # issues with 64-bit targets.
++      ifeq ($(ARCH),powerpc)
++        ifeq ($(call cc-ifversion, -le, 0501, y), y)
++	  @echo "Cannot use CONFIG_GCC_PLUGINS: plugin support on gcc <= 5.1 is buggy on powerpc, please upgrade to gcc 5.2 or newer" >&2 && exit 1
++        endif
++      endif
++      ifeq ($(call cc-ifversion, -ge, 0405, y), y)
++	$(Q)$(srctree)/scripts/gcc-plugin.sh --show-error "$(__PLUGINCC)" "$(HOSTCXX)" "$(CC)" || true
++	@echo "Cannot use CONFIG_GCC_PLUGINS: your gcc installation does not support plugins, perhaps the necessary headers are missing?" >&2 && exit 1
++      else
++	@echo "Cannot use CONFIG_GCC_PLUGINS: your gcc version does not support plugins, you should upgrade it to at least gcc 4.5" >&2 && exit 1
++      endif
++    endif
++  endif
++endif
++	@:
++
++# Actually do the build, if requested.
++PHONY += gcc-plugins
++gcc-plugins: scripts_basic gcc-plugins-check
++ifdef CONFIG_GCC_PLUGINS
++	$(Q)$(MAKE) $(build)=scripts/gcc-plugins
++endif
++	@:
+diff --git a/scripts/Makefile.kcov b/scripts/Makefile.kcov
+new file mode 100644
+index 000000000000..3d61c4bfcbee
+--- /dev/null
++++ b/scripts/Makefile.kcov
+@@ -0,0 +1,9 @@
++ifdef CONFIG_KCOV
++
++kcov-flags-$(CONFIG_CC_HAS_SANCOV_TRACE_PC)	+= -fsanitize-coverage=trace-pc
++kcov-flags-$(CONFIG_KCOV_ENABLE_COMPARISONS)	+= -fsanitize-coverage=trace-cmp
++kcov-flags-$(CONFIG_GCC_PLUGIN_SANCOV)		+= -fplugin=$(objtree)/scripts/gcc-plugins/sancov_plugin.so
++
++export CFLAGS_KCOV := $(kcov-flags-y)
++
++endif
+diff --git a/scripts/Makefile.lib b/scripts/Makefile.lib
+index f97869f1f09b..c98bb3cf21e0 100644
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -119,6 +119,13 @@ _c_flags += $(if $(patsubst n%,, \
+ 		$(CFLAGS_GCOV))
+ endif
+ 
++CFLAGS_KCOV	= -fsanitize-coverage=trace-pc
++ifeq ($(CONFIG_KCOV),y)
++_c_flags += $(if $(patsubst n%,, \
++	$(KCOV_INSTRUMENT_$(basetarget).o)$(KCOV_INSTRUMENT)y), \
++	$(CFLAGS_KCOV))
++endif
++
+ # If building the kernel in a separate objtree expand all occurrences
+ # of -Idir to -I$(srctree)/dir except for absolute paths (starting with '/').
+ 
+diff --git a/scripts/gcc-plugins/Makefile b/scripts/gcc-plugins/Makefile
+new file mode 100644
+index 000000000000..ea465799ced5
+--- /dev/null
++++ b/scripts/gcc-plugins/Makefile
+@@ -0,0 +1,34 @@
++# SPDX-License-Identifier: GPL-2.0
++GCC_PLUGINS_DIR := $(shell $(CC) -print-file-name=plugin)
++
++ifeq ($(PLUGINCC),$(HOSTCC))
++  HOSTLIBS := hostlibs
++  HOST_EXTRACFLAGS += -I$(GCC_PLUGINS_DIR)/include -I$(src) -std=gnu99 -ggdb
++  export HOST_EXTRACFLAGS
++else
++  HOSTLIBS := hostcxxlibs
++  HOST_EXTRACXXFLAGS += -I$(GCC_PLUGINS_DIR)/include -I$(src) -std=gnu++98 -fno-rtti
++  HOST_EXTRACXXFLAGS += -fno-exceptions -fasynchronous-unwind-tables -ggdb
++  HOST_EXTRACXXFLAGS += -Wno-narrowing -Wno-unused-variable
++  export HOST_EXTRACXXFLAGS
++endif
++
++export HOSTLIBS
++
++$(obj)/randomize_layout_plugin.o: $(objtree)/$(obj)/randomize_layout_seed.h
++quiet_cmd_create_randomize_layout_seed = GENSEED $@
++cmd_create_randomize_layout_seed = \
++  $(CONFIG_SHELL) $(srctree)/$(src)/gen-random-seed.sh $@ $(objtree)/include/generated/randomize_layout_hash.h
++$(objtree)/$(obj)/randomize_layout_seed.h: FORCE
++	$(call if_changed,create_randomize_layout_seed)
++targets = randomize_layout_seed.h randomize_layout_hash.h
++
++$(HOSTLIBS)-y := $(foreach p,$(GCC_PLUGIN),$(if $(findstring /,$(p)),,$(p)))
++always := $($(HOSTLIBS)-y)
++
++$(foreach p,$($(HOSTLIBS)-y:%.so=%),$(eval $(p)-objs := $(p).o))
++
++subdir-y := $(GCC_PLUGIN_SUBDIR)
++subdir-  += $(GCC_PLUGIN_SUBDIR)
++
++clean-files += *.so
